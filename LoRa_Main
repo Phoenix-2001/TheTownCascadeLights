@@ -1,0 +1,303 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Preferences.h>
+
+// ================= WIFI =================
+const char* ssid = "Phoenix";
+const char* password = "Harsha dj";
+const char* botToken = "8248041417:AAEfOcW1aVOJ0Z6PEa81Yjia0MdECBpgQ7s";
+const String chatID = "885968591";
+
+// ================= LORA PINS =================
+#define LORA_CS   4
+#define LORA_SCK  5
+#define LORA_MOSI 6
+#define LORA_MISO 7
+#define LORA_RST  15
+#define LORA_DIO0 16
+
+#define LORA_FREQ 433E6
+#define MAX_RETRIES 3
+#define ACK_TIMEOUT 800
+#define HEARTBEAT_TIMEOUT 180000
+
+// ================= LOGGING =================
+#define LOG(x) Serial.println(x)
+#define LOGF(x,y) Serial.print(x); Serial.println(y)
+
+SPIClass spiLoRa(HSPI);
+WiFiClientSecure client;
+UniversalTelegramBot bot(botToken, client);
+Preferences prefs;
+
+uint8_t currentTxID = 0;
+
+struct ValveState {
+  bool state;
+  unsigned long lastSeen;
+};
+
+ValveState valves[5];
+
+// ================= RESET LORA =================
+void resetLoRa() {
+  pinMode(LORA_RST, OUTPUT);
+  digitalWrite(LORA_RST, LOW);
+  delay(20);
+  digitalWrite(LORA_RST, HIGH);
+  delay(50);
+}
+
+// ================= SETUP LORA =================
+void setupLoRa() {
+
+  spiLoRa.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setSPI(spiLoRa);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+
+  resetLoRa();
+
+  if (!LoRa.begin(LORA_FREQ)) {
+    LOG("LoRa INIT FAILED");
+    while (1);
+  }
+
+  LoRa.setTxPower(20);
+  LoRa.setSpreadingFactor(9);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.enableCrc();
+  LoRa.receive();
+
+  LOG("LoRa INIT OK");
+}
+
+// ================= SAFE PRESET =================
+uint16_t getPreset(uint8_t valve) {
+
+  prefs.begin("valves", false);
+
+  String key = "v" + String(valve);
+
+  if (!prefs.isKey(key.c_str())) {
+    prefs.putUShort(key.c_str(), 300);
+  }
+
+  uint16_t val = prefs.getUShort(key.c_str(), 300);
+  prefs.end();
+
+  return val;
+}
+
+// ================= SEND PACKET =================
+void sendPacket(uint8_t target, uint16_t duration, uint8_t hop) {
+
+  LOGF("Sending to node: ", target);
+  LOGF("Duration: ", duration);
+
+  LoRa.beginPacket();
+  LoRa.write(0xAA);
+  LoRa.write(target);
+  LoRa.write(0);
+  LoRa.write(currentTxID);
+  LoRa.write(duration > 0 ? 0x01 : 0x02);
+  LoRa.write(duration >> 8);
+  LoRa.write(duration & 0xFF);
+  LoRa.write(hop);
+  LoRa.write(0);
+  LoRa.write(0);
+  LoRa.write(0);
+  LoRa.write(0x55);
+  LoRa.endPacket();
+
+  LoRa.receive();
+}
+
+// ================= WAIT FOR ACK =================
+bool waitForAck(uint8_t target) {
+
+  unsigned long start = millis();
+
+  while (millis() - start < ACK_TIMEOUT) {
+
+    int size = LoRa.parsePacket();
+    if (!size) continue;
+
+    uint8_t buffer[12];
+    for (int i = 0; i < size; i++)
+      buffer[i] = LoRa.read();
+
+    if (buffer[4] == 0x10 &&
+        buffer[2] == target &&
+        buffer[3] == currentTxID) {
+
+      valves[target].state = buffer[8];
+      valves[target].lastSeen = millis();
+
+      LOG("ACK RECEIVED");
+      return true;
+    }
+  }
+
+  LOG("ACK TIMEOUT");
+  return false;
+}
+
+// ================= INTELLIGENT SEND =================
+bool sendCommand(uint8_t target, uint16_t duration) {
+
+  currentTxID++;
+
+  for (int i = 0; i < MAX_RETRIES; i++) {
+
+    LOGF("Direct attempt: ", i + 1);
+    sendPacket(target, duration, 0);
+
+    if (waitForAck(target)) {
+      return true;
+    }
+  }
+
+  LOG("Switching to Relay Mode");
+  sendPacket(target, duration, 1);
+  return waitForAck(target);
+}
+
+// ================= TELEGRAM UI =================
+void sendMenu() {
+
+  String keyboard =
+  "[[\"V1 ON\",\"V1 OFF\",\"V1 Status\"],"
+  "[\"V2 ON\",\"V2 OFF\",\"V2 Status\"],"
+  "[\"V3 ON\",\"V3 OFF\",\"V3 Status\"],"
+  "[\"V4 ON\",\"V4 OFF\",\"V4 Status\"],"
+  "[\"System Status\"]]";
+
+  bot.sendMessageWithReplyKeyboard(chatID,
+  "Irrigation Control",
+  "", keyboard, true);
+}
+
+// ================= SYSTEM STATUS =================
+void sendSystemStatus() {
+
+  String msg = "Gateway Status\n\n";
+
+  for (int i = 1; i <= 4; i++) {
+    msg += "Valve " + String(i) + ": ";
+    msg += valves[i].state ? "ON" : "OFF";
+
+    if (millis() - valves[i].lastSeen > HEARTBEAT_TIMEOUT)
+      msg += " (Offline)";
+
+    msg += "\n";
+  }
+
+  bot.sendMessage(chatID, msg, "");
+}
+
+// ================= HANDLE TELEGRAM =================
+void handleTelegram() {
+
+  int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+
+  while (numNewMessages) {
+
+    for (int i = 0; i < numNewMessages; i++) {
+
+      String text = bot.messages[i].text;
+
+      if (text == "System Status") {
+        sendSystemStatus();
+        continue;
+      }
+
+      for (int v = 1; v <= 4; v++) {
+
+        if (text == "V" + String(v) + " ON") {
+
+          uint16_t preset = getPreset(v);
+
+          if (sendCommand(v, preset))
+            bot.sendMessage(chatID,
+              "Valve " + String(v) + " ON\nRuntime: " + String(preset) + " sec",
+              "");
+          else
+            bot.sendMessage(chatID,
+              "Valve " + String(v) + " FAILED\nNo ACK received",
+              "");
+        }
+
+        if (text == "V" + String(v) + " OFF") {
+
+          if (sendCommand(v, 0))
+            bot.sendMessage(chatID,
+              "Valve " + String(v) + " OFF",
+              "");
+          else
+            bot.sendMessage(chatID,
+              "Valve " + String(v) + " OFF FAILED",
+              "");
+        }
+
+        if (text == "V" + String(v) + " Status") {
+
+          String msg = "Valve " + String(v) + "\n";
+          msg += "State: ";
+          msg += valves[v].state ? "ON" : "OFF";
+
+          bot.sendMessage(chatID, msg, "");
+        }
+      }
+    }
+
+    numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+  }
+}
+
+// ================= HEARTBEAT CHECK =================
+void checkHeartbeat() {
+
+  for (int v = 1; v <= 4; v++) {
+
+    if (valves[v].lastSeen != 0 &&
+        millis() - valves[v].lastSeen > HEARTBEAT_TIMEOUT) {
+
+      bot.sendMessage(chatID,
+        "Warning: Valve " + String(v) + " Not Responding",
+        "");
+
+      valves[v].lastSeen = millis();
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+  delay(2000);
+
+  LOG("Connecting WiFi...");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  LOG("WiFi Connected");
+
+  client.setInsecure();
+
+  setupLoRa();
+  sendMenu();
+  bot.sendMessage(chatID, "Gateway Online", "");
+}
+
+// ================= LOOP =================
+void loop() {
+
+  handleTelegram();
+  checkHeartbeat();
+}
