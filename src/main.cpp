@@ -1,767 +1,1263 @@
-// ================================================================
-//  GATEWAY FIRMWARE v2.2
-//  ESP32-S3 + LoRa + Telegram + DS3231 RTC
-//
-//  KEY FIXES in this version:
-//  - LoRa.endPacket(true) — synchronous TX so RX mode is ready
-//    before the node's ACK arrives (was the primary no-ACK cause)
-//  - receiveLoRa() no longer consumes CMD_ACK packets, preventing
-//    them from being eaten before waitForAck() can read them
-//  - ACK timeout raised to 2000ms for safety margin
-//  - RTC pins corrected: SDA=8, SCL=18
-//  - Small post-TX settle delay before listening for ACK
-// ================================================================
+/*
+ * ╔══════════════════════════════════════════════════════════════════╗
+ *  TTC_SSR.ino  —  The Town Cascade  —  Smart SSR Controller  v1.0
+ * ╠══════════════════════════════════════════════════════════════════╣
+ *
+ *  HARDWARE
+ *  ─────────────────────────────────────────────────────────────────
+ *  ESP32 DevKit (any 38-pin variant)
+ *  1 × Solid State Relay — DC control 3–32V, AC output 30A+
+ *
+ *  WIRING
+ *  ─────────────────────────────────────────────────────────────────
+ *  GPIO 25  →  SSR  DC+  input terminal
+ *  GND      →  SSR  DC-  input terminal
+ *  ESP32 USB 5V → USB charger (minimum 500mA)
+ *
+ *  SSR AC output terminals switch the mains supply line.
+ *  An electrician must wire the AC side.
+ *
+ *  ⚠  ACTIVE HIGH:  HIGH (3.3V) = SSR ON  /  LOW (0V) = SSR OFF
+ *     GPIO 25 defaults LOW on ESP32 boot → SSR is OFF before
+ *     firmware even starts. Safe by hardware default.
+ *
+ *  WHY SINGLE CORE (not dual)
+ *  ─────────────────────────────────────────────────────────────────
+ *  Safety timers fire in minutes or hours. Telegram can stall 6s.
+ *  A 6s stall cannot meaningfully miss an 8-hour safety ceiling.
+ *  Dual-core would add FreeRTOS queues, mutexes, and inter-core
+ *  race conditions — new failure modes with no practical benefit
+ *  for this use case. Single core is the correct choice here.
+ *
+ *  FEATURES
+ *  ─────────────────────────────────────────────────────────────────
+ *  • SSR ON/OFF via Telegram keyboard
+ *  • Mains ON requires explicit confirmation (30-second window)
+ *  • Countdown timer — presets 30m / 1h / 2h / 4h + custom
+ *  • Cancel timer without changing relay state
+ *  • Safety auto-OFF: hard 8-hour ceiling (configurable)
+ *  • Daily schedules — up to 10, ON or OFF, every day
+ *  • Activity log — last 50 events with IST timestamps
+ *  • Usage stats — lifetime count, today count, ON-time minutes
+ *  • Last ON / last OFF timestamps (persisted in NVS)
+ *  • Multi-user access — admin adds/removes users by Telegram ID
+ *  • Daily midnight summary pushed to admin
+ *  • WiFi watchdog — auto-reconnects across all known networks
+ *  • DNS override — bypasses Jio's DNS using lwIP dns_setserver()
+ *  • WiFi RSSI alert if signal degrades below threshold
+ *  • TLS watchdog — resets Telegram connection if silent 90s
+ *  • Boot notification with retry
+ *  • Full admin command set
+ *
+ *  ADMIN TELEGRAM COMMANDS
+ *  ─────────────────────────────────────────────────────────────────
+ *  /adduser <id>    Add an authorised user by Telegram ID
+ *  /deluser <id>    Remove a user
+ *  /users           List all authorised users
+ *  /delsched <n>    Delete schedule number n  (e.g. /delsched 2)
+ *  /log             Last 20 activity log entries
+ *  /dns             Live DNS diagnostic + canary test
+ *  /reboot          Restart the ESP32 remotely
+ *
+ * ╚══════════════════════════════════════════════════════════════════╝
+ */
 
-#include <Arduino.h>
+// ─────────────────────────────────────────────────────────────────
+//  LIBRARIES
+// ─────────────────────────────────────────────────────────────────
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
-#include <SPI.h>
-#include <LoRa.h>
 #include <Preferences.h>
-#include <RTClib.h>
-#include <Wire.h>
+#include <time.h>
+#include "esp_wifi.h"
+#include "lwip/dns.h"      // Direct lwIP DNS table — only reliable DNS fix on ESP32
+#include "nvs_flash.h"     // Must init before any Preferences call
 
-// ================================================================
-//  CREDENTIALS
-// ================================================================
-static const char*  WIFI_SSID = "Phoenix";
-static const char*  WIFI_PASS = "Harsha dj";
-static const char*  BOT_TOKEN = "8248041417:AAEfOcW1aVOJ0Z6PEa81Yjia0MdECBpgQ7s";
-static const String CHAT_ID   = "885968591";
 
-// ================================================================
-//  LORA PINS  (ESP32-S3, HSPI bus)
-// ================================================================
-#define LORA_CS    4
-#define LORA_SCK   5
-#define LORA_MOSI  6
-#define LORA_MISO  7
-#define LORA_RST   15
-#define LORA_DIO0  16
-#define LORA_FREQ  433E6
+// ═════════════════════════════════════════════════════════════════
+//  ① CONFIGURATION  — Edit these before flashing
+// ═════════════════════════════════════════════════════════════════
 
-// ================================================================
-//  RTC PINS  (DS3231, I2C)
-// ================================================================
-#define RTC_SDA  8
-#define RTC_SCL  18
+#define BOT_TOKEN            "8589849970:AAH7vRuPDr665NTuxQ1-5KT10p1hob07Oz8"
+const int64_t ADMIN_ID     = 5043757292LL;
 
-// ================================================================
-//  PROTOCOL
-// ================================================================
-#define PKT_LEN    13
-#define PKT_START  0xAA
-#define PKT_END    0x55
+// SSR control pin.  Active HIGH: HIGH=ON, LOW=OFF.
+// GPIO 25 idles LOW at ESP32 boot → SSR OFF before firmware runs.
+#define PIN_SSR              25
 
-// Commands (gateway -> node)
-#define CMD_VALVE_ON       0x01
-#define CMD_VALVE_OFF      0x02
-#define CMD_SET_SCHEDULE   0x03
-#define CMD_CLR_SCHEDULE   0x04
-#define CMD_STATUS_REQ     0x05
-// Responses (node -> gateway)
-#define CMD_ACK            0x10
-#define CMD_HEARTBEAT      0x11
-#define CMD_ALERT          0x12
+// Safety ceiling: SSR auto-OFF after this many hours if left on.
+// Set 0 to disable (timers and schedules still work normally).
+#define AUTO_OFF_HOURS       5
 
-// Packet byte indices
-#define IDX_START  0
-#define IDX_DST    1
-#define IDX_SRC    2
-#define IDX_TXID   3
-#define IDX_CMD    4
-#define IDX_P0     5
-#define IDX_P1     6
-#define IDX_P2     7
-#define IDX_P3     8
-#define IDX_P4     9
-#define IDX_P5     10
-#define IDX_CRC    11
-#define IDX_END    12
+// Alert if WiFi RSSI drops below this (dBm). -80 is a safe threshold.
+#define RSSI_ALERT_DBM       (-80)
 
-#define GATEWAY_ID    0
-#define NUM_NODES     4
-#define MAX_SCHEDULES 3
 
-// ================================================================
-//  TIMING
-// ================================================================
-// Raised to 2000ms — at SF9/BW125 each packet is ~260ms air time,
-// so TX + node processing + ACK TX needs comfortable headroom
-#define ACK_TIMEOUT_MS        2000UL
-#define POST_TX_SETTLE_MS       20UL   // wait after TX before listening
-#define HEARTBEAT_TIMEOUT_MS 180000UL
-#define HB_CHECK_INTERVAL_MS  30000UL
-#define TELEGRAM_POLL_MS       2000UL
-#define WIFI_RETRY_MS         10000UL
-#define MAX_TX_RETRIES             3
+// ═════════════════════════════════════════════════════════════════
+//  ② WIFI NETWORKS  — Tried in order; first to connect wins
+// ═════════════════════════════════════════════════════════════════
 
-// ================================================================
-//  STRUCTS
-// ================================================================
+struct WifiCred { const char* ssid; const char* pass; };
+const WifiCred WIFI_LIST[] = {
+  { "The-Town-Cascade",     "TTC@2025"    },
+  { "The-Town-Cascade_EXT", "TTC@2025"    },
+  { "Vybhav",               "Vaibhav2024" },
+  { "Phoenix",              "Harsha dj"   },
+};
+const int WIFI_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ③ GLOBAL STATE
+// ═════════════════════════════════════════════════════════════════
+
+// ── SSR ─────────────────────────────────────────────────────────
+bool          ssrState        = false;   // current physical state
+unsigned long ssrOnSinceMs    = 0;       // millis() when last turned ON
+
+bool          timerActive     = false;
+unsigned long timerEndMs      = 0;
+
+bool          safetyOffDone   = false;   // prevents repeated safety triggers
+
+// ── Usage stats (NVS-backed) ─────────────────────────────────────
+int           lifetimeOnCount = 0;
+time_t        lastOnEpoch     = 0;
+time_t        lastOffEpoch    = 0;
+
+// ── Today's stats (RAM only, reset at midnight) ──────────────────
+int           todayOnCount    = 0;
+unsigned long todayOnSeconds  = 0;
+int8_t        lastSummaryDay  = -1;
+
+// ── WiFi / Telegram ──────────────────────────────────────────────
+String        wifiSSID;
+bool          telegramOK       = false;
+bool          rssiAlerted      = false;
+
+unsigned long tLastPoll        = 0;
+unsigned long tLastBotActive   = 0;
+unsigned long tLastWifiCheck   = 0;
+unsigned long tLastDnsRetry    = 0;
+
+const unsigned long POLL_MS          = 600;
+const unsigned long BOT_WATCHDOG_MS  = 90000;
+const unsigned long WIFI_CHECK_MS    = 30000;
+const unsigned long DNS_RETRY_MS     = 20000;
+const int           MAX_POLL_BATCHES = 10;    // cap on getUpdates() loop
+
+// ── Preferences ──────────────────────────────────────────────────
+Preferences prefs;
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ④ NVS HELPERS  — Only called on state changes, not in loop
+// ═════════════════════════════════════════════════════════════════
+
+void saveStats() {
+  prefs.begin("stats", false);
+  prefs.putInt("total",   lifetimeOnCount);
+  prefs.putLong64("lon",  (int64_t)lastOnEpoch);
+  prefs.putLong64("loff", (int64_t)lastOffEpoch);
+  prefs.end();
+}
+
+void loadStats() {
+  prefs.begin("stats", true);
+  lifetimeOnCount = prefs.getInt("total", 0);
+  lastOnEpoch     = (time_t)prefs.getLong64("lon",  0LL);
+  lastOffEpoch    = (time_t)prefs.getLong64("loff", 0LL);
+  prefs.end();
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑤ USER MANAGEMENT
+// ═════════════════════════════════════════════════════════════════
+
+#define MAX_USERS  10
+int64_t users[MAX_USERS];
+int     userCount = 0;
+
+void saveUsers() {
+  prefs.begin("users", false);
+  prefs.putInt("cnt", userCount);
+  for (int i = 0; i < userCount; i++)
+    prefs.putLong64(("u" + String(i)).c_str(), users[i]);
+  prefs.end();
+}
+
+void loadUsers() {
+  prefs.begin("users", true);
+  userCount = prefs.getInt("cnt", 0);
+  for (int i = 0; i < userCount; i++)
+    users[i] = prefs.getLong64(("u" + String(i)).c_str(), 0LL);
+  prefs.end();
+  if (userCount == 0) {
+    users[0] = ADMIN_ID;
+    userCount = 1;
+    saveUsers();
+  }
+}
+
+bool isAllowed(int64_t id) {
+  for (int i = 0; i < userCount; i++)
+    if (users[i] == id) return true;
+  return false;
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑥ SCHEDULE MANAGEMENT
+// ═════════════════════════════════════════════════════════════════
+
+// Single relay — no zone field needed.
+// days bitmask: bit0=Sun, bit1=Mon … bit6=Sat.  0x7F = every day.
+#define MAX_SCHEDULES  10
+
 struct Schedule {
-    bool     active;
-    uint8_t  hour;
-    uint8_t  minute;
-    uint16_t duration;  // seconds
-    uint8_t  days;      // bitmask: bit0=Sun..bit6=Sat, 0x7F=daily
-
-    Schedule()
-        : active(false), hour(6), minute(0), duration(300), days(0x7F) {}
-    Schedule(bool a, uint8_t h, uint8_t m, uint16_t d, uint8_t w)
-        : active(a), hour(h), minute(m), duration(d), days(w) {}
+  bool    active;
+  uint8_t hour, minute;
+  bool    on;
+  uint8_t days;
 };
+Schedule schedules[MAX_SCHEDULES];
 
-struct NodeState {
-    bool          valveOpen;
-    bool          online;
-    uint8_t       moisture;
-    unsigned long lastSeen;
-    unsigned long valveOnAt;
-    uint16_t      runtime;
-    Schedule      schedules[MAX_SCHEDULES];
-    bool          alertSent;
-
-    NodeState()
-        : valveOpen(false), online(false), moisture(0),
-          lastSeen(0), valveOnAt(0), runtime(0), alertSent(false) {}
-};
-
-// ================================================================
-//  GLOBALS
-// ================================================================
-SPIClass             spiLoRa(HSPI);
-WiFiClientSecure     secClient;
-UniversalTelegramBot bot(BOT_TOKEN, secClient);
-Preferences          prefs;
-RTC_DS3231           rtc;
-bool                 rtcOK = false;
-
-NodeState     nodes[NUM_NODES + 1];  // index 1-4, 0 unused
-uint8_t       txID = 0;
-
-unsigned long lastTelegramPoll = 0;
-unsigned long lastHBCheck      = 0;
-unsigned long lastWiFiRetry    = 0;
-uint8_t       lastSchedMinute  = 255;
-
-// ================================================================
-//  CRC8
-// ================================================================
-static uint8_t crc8(const uint8_t* d, uint8_t len) {
-    uint8_t c = 0;
-    for (uint8_t i = 0; i < len; i++) c ^= d[i];
-    return c;
+void saveSchedules() {
+  prefs.begin("sched", false);
+  prefs.putBytes("d", schedules, sizeof(schedules));
+  prefs.end();
 }
 
-// ================================================================
-//  TELEGRAM: safe send with one retry
-// ================================================================
-static void tgSend(const String& msg) {
-    for (int i = 0; i < 2; i++) {
-        if (bot.sendMessage(CHAT_ID, msg, "")) return;
-        delay(500);
-    }
-    Serial.println("[TG] send failed");
+void loadSchedules() {
+  prefs.begin("sched", true);
+  if (prefs.getBytesLength("d") == sizeof(schedules))
+    prefs.getBytes("d", schedules, sizeof(schedules));
+  prefs.end();
 }
 
-// ================================================================
-//  WIFI
-// ================================================================
-static void wifiConnect() {
-    if (WiFi.status() == WL_CONNECTED) return;
-    Serial.print("[WiFi] Connecting");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 15000UL) {
-        delay(500); Serial.print('.');
-    }
-    Serial.println(WiFi.status() == WL_CONNECTED
-        ? "\n[WiFi] Connected"
-        : "\n[WiFi] FAILED — will retry");
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑦ ACTIVITY LOG  — Ring buffer, last 50 entries, RAM only
+// ═════════════════════════════════════════════════════════════════
+
+#define MAX_LOGS  50
+String logBuf[MAX_LOGS];
+int    logCount = 0;
+
+void addLog(const String& msg) {
+  String ts;
+  time_t now = time(nullptr);
+  if (now > 100000L) {
+    struct tm ti;
+    localtime_r(&now, &ti);
+    char buf[10];
+    snprintf(buf, sizeof(buf), "%02d:%02d  ", ti.tm_hour, ti.tm_min);
+    ts = buf;
+  } else {
+    ts = "??:??  ";
+  }
+  String entry = ts + msg;
+  if (logCount < MAX_LOGS) {
+    logBuf[logCount++] = entry;
+  } else {
+    for (int i = 1; i < MAX_LOGS; i++) logBuf[i-1] = logBuf[i];
+    logBuf[MAX_LOGS-1] = entry;
+  }
+  Serial.println("[LOG] " + entry);
 }
 
-static void checkWiFi() {
-    if (WiFi.status() == WL_CONNECTED) return;
-    if (millis() - lastWiFiRetry < WIFI_RETRY_MS) return;
-    lastWiFiRetry = millis();
-    WiFi.disconnect();
-    delay(100);
-    wifiConnect();
-}
 
-// ================================================================
-//  LORA INIT
-// ================================================================
-static void setupLoRa() {
-    spiLoRa.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-    LoRa.setSPI(spiLoRa);
-    LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
-
-    // Hardware reset
-    pinMode(LORA_RST, OUTPUT);
-    digitalWrite(LORA_RST, LOW);  delay(20);
-    digitalWrite(LORA_RST, HIGH); delay(50);
-
-    if (!LoRa.begin(LORA_FREQ)) {
-        Serial.println("[LoRa] INIT FAILED");
-        while (true) delay(1000);
-    }
-    LoRa.setTxPower(20);
-    LoRa.setSpreadingFactor(9);
-    LoRa.setSignalBandwidth(125E3);
-    LoRa.setCodingRate4(5);
-    LoRa.enableCrc();
-    LoRa.receive();
-    Serial.println("[LoRa] Ready");
-}
-
-// ================================================================
-//  SEND RAW PACKET
-//  Uses endPacket(true) = SYNCHRONOUS — TX fully complete before
-//  returning, so LoRa.receive() is active before node ACK arrives.
-// ================================================================
-static void sendRawPacket(uint8_t dst, uint8_t id, uint8_t cmd,
-                          uint8_t p0, uint8_t p1, uint8_t p2,
-                          uint8_t p3, uint8_t p4, uint8_t p5) {
-    uint8_t pkt[PKT_LEN];
-    pkt[IDX_START] = PKT_START;
-    pkt[IDX_DST]   = dst;
-    pkt[IDX_SRC]   = GATEWAY_ID;
-    pkt[IDX_TXID]  = id;
-    pkt[IDX_CMD]   = cmd;
-    pkt[IDX_P0]    = p0;
-    pkt[IDX_P1]    = p1;
-    pkt[IDX_P2]    = p2;
-    pkt[IDX_P3]    = p3;
-    pkt[IDX_P4]    = p4;
-    pkt[IDX_P5]    = p5;
-    pkt[IDX_CRC]   = crc8(pkt, IDX_CRC);
-    pkt[IDX_END]   = PKT_END;
-
-    LoRa.beginPacket();
-    LoRa.write(pkt, PKT_LEN);
-    LoRa.endPacket(true);       // <<< TRUE = synchronous, waits for TX done
-    delay(POST_TX_SETTLE_MS);   // brief settle before switching to RX
-    LoRa.receive();
-}
-
-// ================================================================
-//  WAIT FOR ACK
-//  IMPORTANT: receiveLoRa() in the main loop does NOT consume
-//  CMD_ACK packets, so they are always available here.
-// ================================================================
-static bool waitForAck(uint8_t target, uint8_t expectedID) {
-    unsigned long start = millis();
-
-    while (millis() - start < ACK_TIMEOUT_MS) {
-        int sz = LoRa.parsePacket();
-        if (!sz) continue;
-
-        uint8_t buf[PKT_LEN] = {0};
-        int n = (sz < PKT_LEN) ? sz : PKT_LEN;
-        for (int i = 0; i < n; i++) buf[i] = LoRa.read();
-        while (LoRa.available()) LoRa.read();
-
-        // Framing
-        if (buf[IDX_START] != PKT_START) continue;
-        if (buf[IDX_END]   != PKT_END)   continue;
-
-        // CRC
-        if (crc8(buf, IDX_CRC) != buf[IDX_CRC]) {
-            Serial.println("[ACK] CRC fail"); continue;
-        }
-
-        // We only want: CMD_ACK, to us, from the right node, matching txID
-        if (buf[IDX_CMD]  != CMD_ACK)      continue;
-        if (buf[IDX_DST]  != GATEWAY_ID)   continue;
-        if (buf[IDX_SRC]  != target)       continue;
-        if (buf[IDX_TXID] != expectedID)   continue;
-
-        // Update node state
-        nodes[target].valveOpen = (buf[IDX_P3] != 0);
-        nodes[target].moisture  = buf[IDX_P4];
-        nodes[target].online    = true;
-        nodes[target].lastSeen  = millis();
-        nodes[target].alertSent = false;
-
-        Serial.printf("[ACK] Node%d Valve:%s\n",
-            target, nodes[target].valveOpen ? "ON" : "OFF");
-        return true;
-    }
-
-    Serial.printf("[ACK] TIMEOUT node%d\n", target);
-    return false;
-}
-
-// ================================================================
-//  SEND COMMAND: direct attempts then relay fallback
-// ================================================================
-static bool sendCommand(uint8_t target, uint8_t cmd,
-                        uint8_t p0 = 0, uint8_t p1 = 0, uint8_t p2 = 0,
-                        uint8_t p3 = 0, uint8_t p4 = 0, uint8_t p5 = 0) {
-    txID++;
-    if (txID == 0xFF) txID = 0;  // 0xFF reserved for heartbeats
-
-    // Direct attempts
-    for (int i = 0; i < MAX_TX_RETRIES; i++) {
-        Serial.printf("[TX] Attempt %d -> Node%d cmd=0x%02X\n", i+1, target, cmd);
-        sendRawPacket(target, txID, cmd, p0, p1, p2, p3, p4, p5);
-        if (waitForAck(target, txID)) return true;
-        delay(100);
-    }
-
-    // Relay fallback: use any online node as bridge
-    Serial.println("[TX] Direct failed, trying relay...");
-    for (int relay = 1; relay <= NUM_NODES; relay++) {
-        if (relay == (int)target)    continue;
-        if (!nodes[relay].online)   continue;
-        Serial.printf("[TX] Relay via Node%d\n", relay);
-        // p5 = relay node ID; relay node sees dst!=self, p5==self, forwards
-        sendRawPacket(target, txID, cmd, p0, p1, p2, p3, p4, (uint8_t)relay);
-        if (waitForAck(target, txID)) return true;
-    }
-
-    nodes[target].online = false;
-    Serial.printf("[TX] Node%d unreachable\n", target);
-    return false;
-}
-
-// ================================================================
-//  NVS PERSISTENCE
-// ================================================================
-static void saveSchedule(uint8_t valve, uint8_t slot) {
-    if (valve < 1 || valve > NUM_NODES || slot >= MAX_SCHEDULES) return;
-    prefs.begin("gw_sc", false);
-    char k[12];
-    const Schedule& s = nodes[valve].schedules[slot];
-    snprintf(k, sizeof(k), "v%us%ua", valve, slot); prefs.putUChar(k,  s.active ? 1u : 0u);
-    snprintf(k, sizeof(k), "v%us%uh", valve, slot); prefs.putUChar(k,  s.hour);
-    snprintf(k, sizeof(k), "v%us%um", valve, slot); prefs.putUChar(k,  s.minute);
-    snprintf(k, sizeof(k), "v%us%ud", valve, slot); prefs.putUShort(k, s.duration);
-    snprintf(k, sizeof(k), "v%us%uw", valve, slot); prefs.putUChar(k,  s.days);
-    prefs.end();
-}
-
-static void loadAllSchedules() {
-    prefs.begin("gw_sc", true);
-    char k[12];
-    for (uint8_t v = 1; v <= NUM_NODES; v++) {
-        for (uint8_t s = 0; s < MAX_SCHEDULES; s++) {
-            Schedule& sc = nodes[v].schedules[s];
-            snprintf(k, sizeof(k), "v%us%ua", v, s); sc.active   = prefs.getUChar(k, 0) != 0;
-            snprintf(k, sizeof(k), "v%us%uh", v, s); sc.hour     = prefs.getUChar(k, 6);
-            snprintf(k, sizeof(k), "v%us%um", v, s); sc.minute   = prefs.getUChar(k, 0);
-            snprintf(k, sizeof(k), "v%us%ud", v, s); sc.duration = prefs.getUShort(k, 300);
-            snprintf(k, sizeof(k), "v%us%uw", v, s); sc.days     = prefs.getUChar(k, 0x7F);
-        }
-    }
-    prefs.end();
-    Serial.println("[NVS] Schedules loaded");
-}
-
-// ================================================================
-//  RTC SCHEDULE CHECK (fires once per minute)
-// ================================================================
-static void checkSchedules() {
-    if (!rtcOK) return;
-    DateTime now = rtc.now();
-    uint8_t curMin = now.minute();
-    if (curMin == lastSchedMinute) return;
-    lastSchedMinute = curMin;
-
-    uint8_t dayBit = (uint8_t)(1u << now.dayOfTheWeek());
-
-    for (uint8_t v = 1; v <= NUM_NODES; v++) {
-        for (uint8_t s = 0; s < MAX_SCHEDULES; s++) {
-            const Schedule& sc = nodes[v].schedules[s];
-            if (!sc.active)               continue;
-            if (!(sc.days & dayBit))      continue;
-            if (sc.hour   != now.hour())  continue;
-            if (sc.minute != now.minute()) continue;
-
-            if (nodes[v].valveOpen) {
-                Serial.printf("[SCHED] V%d already open, skip\n", v);
-                continue;
-            }
-
-            Serial.printf("[SCHED] Fire V%d slot%d\n", v, s);
-            bool ok = sendCommand(v, CMD_VALVE_ON,
-                                  (uint8_t)(sc.duration >> 8),
-                                  (uint8_t)(sc.duration & 0xFF));
-            if (ok) {
-                nodes[v].valveOnAt = millis();
-                nodes[v].runtime   = sc.duration;
-                tgSend("⏰ Schedule: Valve " + String(v) +
-                       " ON for " + String(sc.duration) + "s");
-            } else {
-                tgSend("⚠️ Schedule FAILED: Valve " + String(v));
-            }
-        }
-    }
-}
-
-// ================================================================
-//  AUTO OFF
-// ================================================================
-static void checkAutoOff() {
-    for (uint8_t v = 1; v <= NUM_NODES; v++) {
-        if (!nodes[v].valveOpen || nodes[v].runtime == 0) continue;
-        if (millis() - nodes[v].valveOnAt < (unsigned long)nodes[v].runtime * 1000UL) continue;
-
-        Serial.printf("[AUTO-OFF] V%d\n", v);
-        bool ok = sendCommand(v, CMD_VALVE_OFF);
-        if (ok) {
-            nodes[v].valveOpen = false;
-            nodes[v].runtime   = 0;
-            tgSend("✅ Valve " + String(v) + " auto-OFF");
-        } else {
-            // Reset timer — retry at next loop iteration after runtime again
-            nodes[v].valveOnAt = millis();
-            tgSend("⚠️ Valve " + String(v) + " auto-OFF failed — retrying");
-        }
-    }
-}
-
-// ================================================================
-//  RECEIVE UNSOLICITED LoRa (heartbeats + alerts ONLY)
+// ═════════════════════════════════════════════════════════════════
+//  ⑧ DNS OVERRIDE
 //
-//  CRITICAL: This function deliberately ignores CMD_ACK packets.
-//  If it consumed ACKs, waitForAck() would time out because the
-//  ACK would already be drained from the LoRa FIFO here.
-// ================================================================
-static void receiveLoRa() {
-    int sz = LoRa.parsePacket();
-    if (!sz) return;
+//  WiFi.config() / WiFi.setDNS() silently fail after DHCP on ESP32.
+//  dns_setserver() writes directly into lwIP's resolver table —
+//  the same table all DNS lookups actually read from.
+//  Called once after every successful WiFi connect.
+// ═════════════════════════════════════════════════════════════════
 
-    uint8_t buf[PKT_LEN] = {0};
-    int n = (sz < PKT_LEN) ? sz : PKT_LEN;
-    for (int i = 0; i < n; i++) buf[i] = LoRa.read();
-    while (LoRa.available()) LoRa.read();
-
-    if (buf[IDX_START] != PKT_START) return;
-    if (buf[IDX_END]   != PKT_END)   return;
-    if (crc8(buf, IDX_CRC) != buf[IDX_CRC]) {
-        Serial.println("[RX] CRC fail"); return;
-    }
-
-    uint8_t cmd = buf[IDX_CMD];
-
-    // ACK packets belong to waitForAck() — do NOT consume them here
-    if (cmd == CMD_ACK) return;
-
-    uint8_t src = buf[IDX_SRC];
-    if (src < 1 || src > NUM_NODES) return;
-
-    if (cmd == CMD_HEARTBEAT) {
-        nodes[src].valveOpen = (buf[IDX_P0] != 0);
-        nodes[src].moisture  = buf[IDX_P1];
-        nodes[src].online    = true;
-        nodes[src].lastSeen  = millis();
-        nodes[src].alertSent = false;
-        Serial.printf("[HB] Node%d Valve:%s\n",
-            src, buf[IDX_P0] ? "ON" : "OFF");
-        return;
-    }
-
-    if (cmd == CMD_ALERT) {
-        String msg = "🚨 Valve " + String(src) + ": ";
-        switch (buf[IDX_P0]) {
-            case 0x01: msg += "Low pressure";   break;
-            case 0x02: msg += "Flow fault";     break;
-            case 0x03: msg += "Moisture low";   break;
-            case 0x04: msg += "Relay stuck";    break;
-            default:   msg += "Error 0x" + String(buf[IDX_P0], HEX);
-        }
-        tgSend(msg);
-    }
+void forceDNS() {
+  ip_addr_t g, c;
+  IP4_ADDR(ip_2_ip4(&g), 8, 8, 8, 8);   g.type = IPADDR_TYPE_V4;  // Google
+  IP4_ADDR(ip_2_ip4(&c), 1, 1, 1, 1);   c.type = IPADDR_TYPE_V4;  // Cloudflare
+  dns_setserver(0, &g);
+  dns_setserver(1, &c);
+  const ip_addr_t* r = dns_getserver(0);
+  Serial.printf("[DNS] lwIP slot 0: %s\n", r ? ipaddr_ntoa(r) : "FAILED");
 }
 
-// ================================================================
-//  HEARTBEAT CHECK
-// ================================================================
-static void checkHeartbeat() {
-    if (millis() - lastHBCheck < HB_CHECK_INTERVAL_MS) return;
-    lastHBCheck = millis();
-    for (uint8_t v = 1; v <= NUM_NODES; v++) {
-        if (nodes[v].lastSeen == 0) continue;
-        bool timedOut = (millis() - nodes[v].lastSeen > HEARTBEAT_TIMEOUT_MS);
-        if (timedOut && nodes[v].online && !nodes[v].alertSent) {
-            nodes[v].online    = false;
-            nodes[v].alertSent = true;
-            tgSend("⚠️ Valve " + String(v) + " OFFLINE");
-        }
-    }
+// Blocking canary test.
+// ONLY called from: connectWiFi() once, and admin /dns command.
+// NEVER called in loop() — blocks up to 6s, would delay safety ticks.
+bool verifyDNS() {
+  IPAddress ip;
+  bool ok = (WiFi.hostByName("pool.ntp.org", ip) == 1);
+  Serial.printf("[DNS] Canary: %s\n", ok ? ip.toString().c_str() : "FAILED");
+  return ok;
 }
 
-// ================================================================
-//  TELEGRAM HELPERS
-// ================================================================
-static String timeStr(uint8_t h, uint8_t m) {
-    char buf[6]; snprintf(buf, sizeof(buf), "%02u:%02u", h, m);
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑨ TELEGRAM CLIENT + ADMIN ALERT
+//  Defined before SSR functions so sendAdminAlert() is available
+//  to the safety handlers with no forward declarations.
+// ═════════════════════════════════════════════════════════════════
+
+WiFiClientSecure    secClient;
+UniversalTelegramBot bot(BOT_TOKEN, secClient);
+
+// Safe to call from anywhere.  Silent drop if Telegram is offline.
+void sendAdminAlert(const String& msg) {
+  if (!telegramOK) {
+    Serial.println("[ALERT-SKIP] " + msg.substring(0, 50));
+    return;
+  }
+  bot.sendMessage(String(ADMIN_ID), msg, "Markdown");
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑩ SSR CONTROL
+//  setSSR() is the SINGLE point of relay control.
+//  All state changes, logging, and statistics happen here.
+// ═════════════════════════════════════════════════════════════════
+
+// Active HIGH: HIGH=ON, LOW=OFF
+inline void ssrHardOn()  { digitalWrite(PIN_SSR, HIGH); }
+inline void ssrHardOff() { digitalWrite(PIN_SSR, LOW);  }
+
+void setSSR(bool on) {
+  // Guard: no-op if already in requested state.
+  // Prevents double-counting stats when called redundantly.
+  if (on == ssrState) return;
+
+  on ? ssrHardOn() : ssrHardOff();
+  ssrState = on;
+
+  if (on) {
+    ssrOnSinceMs  = millis();
+    safetyOffDone = false;
+    lifetimeOnCount++;
+    todayOnCount++;
+    lastOnEpoch = time(nullptr);
+    saveStats();
+    addLog("SSR ON");
+  } else {
+    // Accumulate session ON-time into today's total
+    if (ssrOnSinceMs > 0)
+      todayOnSeconds += (millis() - ssrOnSinceMs) / 1000UL;
+    timerActive  = false;   // cancel any running countdown
+    lastOffEpoch = time(nullptr);
+    saveStats();
+    addLog("SSR OFF");
+  }
+}
+
+// ── Countdown timer ──────────────────────────────────────────────
+void setTimer(uint16_t minutes) {
+  // Turn SSR on only if it's currently off (avoids double ON-event)
+  if (!ssrState) setSSR(true);
+  timerActive = true;
+  timerEndMs  = millis() + (unsigned long)minutes * 60000UL;
+  addLog("Timer set: " + String(minutes) + " min");
+}
+
+void cancelTimer() {
+  timerActive = false;
+  addLog("Timer cancelled");
+}
+
+// Called every loop iteration — no delay(), no blocking
+void tickTimer() {
+  if (!timerActive) return;
+  // Signed subtraction handles millis() 49-day rollover correctly
+  if ((long)(millis() - timerEndMs) >= 0) {
+    timerActive = false;
+    setSSR(false);
+    sendAdminAlert("⏱ *Timer expired* — SSR OFF");
+  }
+}
+
+// ── Safety auto-OFF ceiling ──────────────────────────────────────
+// Independent of the user timer.  Hard ceiling after AUTO_OFF_HOURS.
+void tickSafety() {
+#if AUTO_OFF_HOURS > 0
+  if (!ssrState || safetyOffDone) return;
+  unsigned long limitMs = (unsigned long)AUTO_OFF_HOURS * 3600000UL;
+  if ((long)(millis() - ssrOnSinceMs) >= (long)limitMs) {
+    safetyOffDone = true;   // set before setSSR() to prevent re-entry
+    setSSR(false);
+    sendAdminAlert("🛡 *Safety auto-OFF*\n"
+                   "SSR was ON for " + String(AUTO_OFF_HOURS) + "h.\n"
+                   "Switched off automatically.");
+  }
+#endif
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑪ KEYBOARDS
+// ═════════════════════════════════════════════════════════════════
+
+// Main menu
+const String KBD_MAIN =
+  "[[{\"text\":\"⚡ SSR ON\"},{\"text\":\"⚡ SSR OFF\"}],"
+  "[{\"text\":\"⏱ Timer\"},{\"text\":\"❌ Cancel Timer\"}],"
+  "[{\"text\":\"📊 STATUS\"},{\"text\":\"⏰ Schedules\"}]]";
+
+// Timer presets
+const String KBD_TIMER =
+  "[[{\"text\":\"⏱ 30 min\"},{\"text\":\"⏱ 1h\"}],"
+  "[{\"text\":\"⏱ 2h\"},{\"text\":\"⏱ 4h\"}],"
+  "[{\"text\":\"✏ Custom\"}],"
+  "[{\"text\":\"⬅ Back\"}]]";
+
+// Mains ON safety confirmation (30-second window)
+const String KBD_CONFIRM =
+  "[[{\"text\":\"✅ YES — Switch ON\"},{\"text\":\"❌ CANCEL\"}]]";
+
+// Schedule management
+const String KBD_SCHED =
+  "[[{\"text\":\"📋 List Schedules\"}],"
+  "[{\"text\":\"➕ Add Schedule\"}],"
+  "[{\"text\":\"⬅ Back\"}]]";
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑫ STATUS + MENU BUILDERS
+// ═════════════════════════════════════════════════════════════════
+
+void showMain(const String& chat,
+              const String& msg = "🏠 *TTC SSR Controller*") {
+  bot.sendMessageWithReplyKeyboard(chat, msg, "Markdown", KBD_MAIN, true);
+}
+
+String buildStatus() {
+  String s = "📊 *System Status*\n\n";
+
+  // WiFi
+  if (WiFi.status() == WL_CONNECTED) {
+    s += "📡 *WiFi:* "; s += wifiSSID;
+    s += "  "; s += WiFi.RSSI(); s += " dBm\n";
+  } else {
+    s += "📡 *WiFi:* ❌ Disconnected\n";
+  }
+
+  // Active DNS — confirms Jio override is working
+  const ip_addr_t* d = dns_getserver(0);
+  s += "🌐 *DNS:* "; s += d ? ipaddr_ntoa(d) : "unknown"; s += "\n";
+
+  // Time
+  time_t now = time(nullptr);
+  if (now > 100000L) {
+    struct tm ti; localtime_r(&now, &ti);
+    char ts[32]; strftime(ts, sizeof(ts), "%d %b %Y  %H:%M IST", &ti);
+    s += "🕐 "; s += ts; s += "\n";
+  } else {
+    s += "🕐 NTP syncing...\n";
+  }
+
+  // Uptime
+  unsigned long sec = millis() / 1000;
+  s += "🔋 *Uptime:* ";
+  s += String(sec / 3600); s += "h ";
+  s += String((sec % 3600) / 60); s += "m\n\n";
+
+  // SSR state
+  s += "⚡ *SSR (30A):* ";
+  s += ssrState ? "ON 🟢" : "OFF ⚫";
+  s += "\n";
+
+  if (ssrState) {
+    unsigned long onSec = (millis() - ssrOnSinceMs) / 1000;
+    s += "   On for: *";
+    s += String(onSec / 60); s += "m ";
+    s += String(onSec % 60); s += "s*\n";
+
+    if (timerActive) {
+      long remMs = (long)(timerEndMs - millis());
+      if (remMs > 0) {
+        s += "   ⏱ Timer: *";
+        s += String(remMs / 60000L); s += " min left*\n";
+      }
+    }
+
+#if AUTO_OFF_HOURS > 0
+    long autoRemMs = (long)((unsigned long)AUTO_OFF_HOURS * 3600000UL
+                            - (millis() - ssrOnSinceMs));
+    if (autoRemMs > 0) {
+      s += "   🛡 Safety OFF in: *";
+      s += String(autoRemMs / 3600000L); s += "h ";
+      s += String((autoRemMs % 3600000L) / 60000L); s += "m*\n";
+    }
+#endif
+  }
+
+  // Usage stats
+  s += "\n📈 *Usage Today*\n";
+  s += "Events: *"; s += todayOnCount; s += "*   ";
+  unsigned long liveSec = ssrState ? (millis() - ssrOnSinceMs) / 1000 : 0;
+  s += "ON time: *"; s += (todayOnSeconds + liveSec) / 60; s += " min*\n";
+
+  s += "\n📈 *Lifetime*\n";
+  s += "Total ON events: *"; s += lifetimeOnCount; s += "*\n";
+
+  auto fmtEpoch = [](time_t t) -> String {
+    if (t < 100000L) return "—";
+    struct tm ti; localtime_r(&t, &ti);
+    char buf[18]; strftime(buf, sizeof(buf), "%d %b  %H:%M", &ti);
     return String(buf);
+  };
+
+  s += "Last ON:  *"; s += fmtEpoch(lastOnEpoch);  s += "*\n";
+  s += "Last OFF: *"; s += fmtEpoch(lastOffEpoch); s += "*\n";
+
+  return s;
 }
 
-static void sendMainMenu() {
-    String kb =
-        "[[\"💧 V1 ON\",\"⛔ V1 OFF\",\"📊 V1 Info\"],"
-        "[\"💧 V2 ON\",\"⛔ V2 OFF\",\"📊 V2 Info\"],"
-        "[\"💧 V3 ON\",\"⛔ V3 OFF\",\"📊 V3 Info\"],"
-        "[\"💧 V4 ON\",\"⛔ V4 OFF\",\"📊 V4 Info\"],"
-        "[\"📅 Schedules\",\"📡 Status\",\"🕐 RTC\"]]";
-    bot.sendMessageWithReplyKeyboard(CHAT_ID, "🌱 Irrigation Gateway", "", kb, true);
+String buildSchedList() {
+  String s = "⏰ *Schedules*\n\n";
+  bool any = false;
+  for (int i = 0; i < MAX_SCHEDULES; i++) {
+    if (!schedules[i].active) continue;
+    any = true;
+    char t[6];
+    snprintf(t, sizeof(t), "%02d:%02d", schedules[i].hour, schedules[i].minute);
+    s += "#"; s += i; s += "  *"; s += t; s += "*";
+    s += "  →  *"; s += schedules[i].on ? "ON" : "OFF"; s += "*\n";
+  }
+  if (!any) s += "_No schedules configured._\n";
+  s += "\nDelete: /delsched <n>   e.g. /delsched 2";
+  return s;
 }
 
-static void sendSystemStatus() {
-    String msg = "📡 System Status\n";
-    if (rtcOK) {
-        DateTime now = rtc.now();
-        char tb[20]; snprintf(tb, sizeof(tb), "🕐 %02d:%02d:%02d\n\n",
-            now.hour(), now.minute(), now.second());
-        msg += tb;
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑬ WIFI — connectWiFi / checkWiFi / checkDNS
+// ═════════════════════════════════════════════════════════════════
+
+bool connectWiFi() {
+  // Full radio reset before each sequence.
+  // Clears stale DHCP/association state with Jio Fiber + TP-Link.
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(300);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);          // don't write credentials to NVS
+  WiFi.setAutoReconnect(false);    // we manage reconnect ourselves
+  WiFi.setSleep(WIFI_PS_NONE);     // Jio 2025 drops sleeping clients
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  delay(100);
+
+  for (int i = 0; i < WIFI_COUNT; i++) {
+    Serial.printf("[WiFi] Trying: %s\n", WIFI_LIST[i].ssid);
+    WiFi.begin(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
+
+    // 18s timeout — TP-Link extender relays DHCP to Jio (double-hop)
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 18000)
+      delay(300);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSSID = WIFI_LIST[i].ssid;
+      Serial.printf("[WiFi] Connected: %s  RSSI:%d  CH:%d  IP:%s\n",
+                    wifiSSID.c_str(), WiFi.RSSI(),
+                    (int)WiFi.channel(),
+                    WiFi.localIP().toString().c_str());
+
+      delay(200);       // let DHCP fully settle before writing DNS
+      forceDNS();
+      bool ok = verifyDNS();   // blocking — acceptable here (once per connect)
+      telegramOK  = ok;
+      tLastDnsRetry = millis();
+      if (!ok) Serial.println("[DNS] Canary failed — checkDNS() will retry");
+      return true;
     }
-    for (uint8_t v = 1; v <= NUM_NODES; v++) {
-        msg += "Valve " + String(v) + ": ";
-        msg += nodes[v].valveOpen ? "💧 ON  " : "⭕ OFF ";
-        msg += nodes[v].online    ? "✅\n"     : "❌ Offline\n";
+
+    WiFi.disconnect(true);
+    delay(800);   // let extender clear the failed association
+  }
+
+  Serial.println("[WiFi] All networks failed");
+  return false;
+}
+
+void checkWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // RSSI monitor
+    int rssi = WiFi.RSSI();
+    if (rssi < RSSI_ALERT_DBM && !rssiAlerted) {
+      rssiAlerted = true;
+      sendAdminAlert("📶 *WiFi signal weak*\n" + wifiSSID +
+                     ": " + String(rssi) + " dBm");
+    } else if (rssi >= RSSI_ALERT_DBM - 5 && rssiAlerted) {
+      rssiAlerted = false;   // 5 dBm hysteresis — prevents flapping
+      sendAdminAlert("📶 *WiFi signal recovered* — " + String(rssi) + " dBm");
     }
-    tgSend(msg);
+    return;
+  }
+
+  wifiSSID   = "";
+  telegramOK = false;
+  rssiAlerted = false;
+  Serial.println("[WiFi] Lost — reconnecting...");
+
+  if (connectWiFi()) {
+    // IST = UTC+5:30 = 19800 s offset
+    configTime(19800, 0, "pool.ntp.org", "time.google.com");
+    addLog("WiFi reconnected: " + wifiSSID);
+    if (telegramOK)
+      sendAdminAlert("🔄 *WiFi back:* " + wifiSSID +
+                     "  " + String(WiFi.RSSI()) + " dBm");
+  }
 }
 
-static void sendValveInfo(uint8_t v) {
-    sendCommand(v, CMD_STATUS_REQ);  // refresh state
-    String msg = "📊 Valve " + String(v) + "\n";
-    msg += nodes[v].valveOpen ? "State : 💧 ON\n" : "State : ⭕ OFF\n";
-    msg += nodes[v].online    ? "Link  : ✅\n"     : "Link  : ❌ Offline\n";
-    msg += "\nSchedules:\n";
-    for (uint8_t s = 0; s < MAX_SCHEDULES; s++) {
-        const Schedule& sc = nodes[v].schedules[s];
-        msg += "  Slot " + String(s+1) + ": ";
-        msg += sc.active
-            ? timeStr(sc.hour, sc.minute) + " | " + String(sc.duration) + "s\n"
-            : "Not set\n";
+// Re-applies DNS every DNS_RETRY_MS when Telegram is not reachable.
+// Does NOT call verifyDNS() here — blocking in the loop delays timers.
+// Verification happens implicitly: next successful pollTelegram() sets
+// telegramOK = true, which stops retries.
+void checkDNS() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (telegramOK) return;
+  if ((long)(millis() - tLastDnsRetry) < (long)DNS_RETRY_MS) return;
+  tLastDnsRetry = millis();
+  Serial.println("[DNS] Re-applying override...");
+  forceDNS();
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑭ SESSIONS  — Per-chat-ID state prevents cross-user interference
+// ═════════════════════════════════════════════════════════════════
+
+// Schedule wizard steps.  SS_ZONE removed — single relay, no ambiguity.
+enum SchedStep : uint8_t { SS_NONE = 0, SS_TIME, SS_ACTION };
+
+#define MAX_SESSIONS  8
+
+struct Session {
+  int64_t       chatId;
+  bool          awaitTimerMin;    // user is typing custom timer minutes
+  bool          awaitConfirm;     // waiting for SSR ON confirmation
+  unsigned long confirmExpiry;    // millis() deadline for confirm window
+  SchedStep     schedStep;        // wizard progress
+  uint8_t       schedHour;
+  uint8_t       schedMin;
+};
+
+Session sessions[MAX_SESSIONS];
+int     sessCount = 0;
+
+Session* getSession(int64_t id) {
+  for (int i = 0; i < sessCount; i++)
+    if (sessions[i].chatId == id) return &sessions[i];
+  if (sessCount < MAX_SESSIONS) {
+    sessions[sessCount] = {id, false, false, 0, SS_NONE, 0, 0};
+    return &sessions[sessCount++];
+  }
+  // LRU evict: drop slot 0
+  for (int i = 0; i < MAX_SESSIONS - 1; i++) sessions[i] = sessions[i+1];
+  sessions[MAX_SESSIONS-1] = {id, false, false, 0, SS_NONE, 0, 0};
+  return &sessions[MAX_SESSIONS-1];
+}
+
+void resetSession(Session* s) {
+  s->awaitTimerMin  = false;
+  s->awaitConfirm   = false;
+  s->confirmExpiry  = 0;
+  s->schedStep      = SS_NONE;
+}
+
+// Expire stale confirmations silently — called once per loop.
+// Uses signed subtraction for millis() 49-day rollover safety.
+void tickConfirmExpiry() {
+  for (int i = 0; i < sessCount; i++) {
+    if (!sessions[i].awaitConfirm) continue;
+    if ((long)(millis() - sessions[i].confirmExpiry) >= 0) {
+      sessions[i].awaitConfirm = false;
+      Serial.printf("[CONFIRM] Expired for %lld\n",
+                    (long long)sessions[i].chatId);
     }
-    tgSend(msg);
+  }
 }
 
-static void sendScheduleHelp() {
-    tgSend(
-        "📅 Schedule Commands\n\n"
-        "Set:   SET V1 SCHED 1 06:30 600\n"
-        "       (valve 1-4, slot 1-3, HH:MM, duration sec)\n\n"
-        "Clear: CLR V1 SCHED 1\n\n"
-        "Time:  SET TIME 14:30"
-    );
-}
 
-static void sendRTCStatus() {
-    if (!rtcOK) { tgSend("❌ RTC not found"); return; }
-    DateTime now = rtc.now();
-    char buf[64];
-    snprintf(buf, sizeof(buf), "🕐 %04d-%02d-%02d %02d:%02d:%02d\nTemp: %.1f°C",
-        now.year(), now.month(), now.day(),
-        now.hour(), now.minute(), now.second(),
-        rtc.getTemperature());
-    tgSend(String(buf));
-}
+// ═════════════════════════════════════════════════════════════════
+//  ⑮ MESSAGE HANDLER
+// ═════════════════════════════════════════════════════════════════
 
-// ================================================================
-//  COMMAND PARSERS
-// ================================================================
-static uint8_t parseDayMask(const String& s) {
-    if (s.length() < 7) return 0x7F;
-    uint8_t m = 0;
-    if (s[0] != '-') m |= 0x01;
-    if (s[1] != '-') m |= 0x02;
-    if (s[2] != '-') m |= 0x04;
-    if (s[3] != '-') m |= 0x08;
-    if (s[4] != '-') m |= 0x10;
-    if (s[5] != '-') m |= 0x20;
-    if (s[6] != '-') m |= 0x40;
-    return m;
-}
+void handleMessage(int idx) {
+  String  chatStr = bot.messages[idx].chat_id;
+  int64_t chatId  = atoll(chatStr.c_str());
+  String  t       = bot.messages[idx].text;
+  t.trim();
 
-static void handleSetSchedule(const String& text) {
-    // Format: SET V1 SCHED 1 06:30 600 [SMTWTFS]
-    if (text.length() < 22) { tgSend("❌ Format: SET V1 SCHED 1 06:30 600"); return; }
+  // ── Authorisation ──────────────────────────────────────────────
+  if (!isAllowed(chatId)) {
+    bot.sendMessage(chatStr,
+      "❌ Not authorised.\nAsk the admin for access.", "");
+    return;
+  }
 
-    int valve = text.charAt(5) - '0';
-    if (valve < 1 || valve > NUM_NODES) { tgSend("❌ Valve 1-4"); return; }
+  tLastBotActive = millis();
+  telegramOK     = true;
+  Session* s     = getSession(chatId);
 
-    int sp = text.indexOf("SCHED ");
-    if (sp < 0) { tgSend("❌ Missing SCHED"); return; }
+  // ── /start ─────────────────────────────────────────────────────
+  if (t == "/start") {
+    resetSession(s);
+    showMain(chatStr, "✅ *TTC SSR Controller v1*\n30A SSR ready.");
+    return;
+  }
 
-    int slot = text.charAt(sp + 6) - '1';
-    if (slot < 0 || slot >= MAX_SCHEDULES) { tgSend("❌ Slot 1-3"); return; }
+  // ── Admin commands ──────────────────────────────────────────────
+  if (chatId == ADMIN_ID) {
 
-    int tp = sp + 8;
-    if (tp + 5 >= (int)text.length()) { tgSend("❌ Missing HH:MM"); return; }
-
-    int h = text.substring(tp,     tp+2).toInt();
-    int m = text.substring(tp+3,   tp+5).toInt();
-    if (h < 0 || h > 23 || m < 0 || m > 59) { tgSend("❌ Bad time"); return; }
-
-    int dp = tp + 6;
-    if (dp >= (int)text.length()) { tgSend("❌ Missing duration"); return; }
-
-    int de = text.indexOf(' ', dp);
-    int dur;
-    uint8_t mask = 0x7F;
-    if (de < 0) {
-        dur = text.substring(dp).toInt();
-    } else {
-        dur = text.substring(dp, de).toInt();
-        String ds = text.substring(de + 1); ds.trim();
-        mask = parseDayMask(ds);
+    // /adduser
+    if (t.startsWith("/adduser ")) {
+      if (userCount >= MAX_USERS) {
+        bot.sendMessage(chatStr, "❌ User list full (max " +
+                        String(MAX_USERS) + ")", "");
+        return;
+      }
+      int64_t u = atoll(t.substring(9).c_str());
+      if (!u) { bot.sendMessage(chatStr, "❌ Invalid ID", ""); return; }
+      users[userCount++] = u;
+      saveUsers();
+      addLog("User added: " + String(u));
+      bot.sendMessage(chatStr, "✅ User " + String(u) + " added", "");
+      return;
     }
-    if (dur < 1 || dur > 7200) { tgSend("❌ Duration 1-7200s"); return; }
 
-    Schedule& sc = nodes[valve].schedules[slot];
-    sc.active   = true;
-    sc.hour     = (uint8_t)h;
-    sc.minute   = (uint8_t)m;
-    sc.duration = (uint16_t)dur;
-    sc.days     = mask;
-    saveSchedule((uint8_t)valve, (uint8_t)slot);
+    // /deluser
+    if (t.startsWith("/deluser ")) {
+      int64_t u = atoll(t.substring(9).c_str());
+      if (u == ADMIN_ID) {
+        bot.sendMessage(chatStr, "❌ Cannot remove admin", ""); return;
+      }
+      bool found = false;
+      for (int k = 0; k < userCount; k++) {
+        if (users[k] != u) continue;
+        for (int j = k; j < userCount - 1; j++) users[j] = users[j+1];
+        userCount--;
+        saveUsers();
+        found = true;
+        addLog("User removed: " + String(u));
+        break;
+      }
+      bot.sendMessage(chatStr, found ? "✅ Removed" : "❌ Not found", "");
+      return;
+    }
 
-    bool ok = sendCommand((uint8_t)valve, CMD_SET_SCHEDULE,
-                          (uint8_t)slot, (uint8_t)h, (uint8_t)m,
-                          (uint8_t)(dur>>8), (uint8_t)(dur&0xFF), mask);
-    tgSend(ok
-        ? "✅ Sched set V" + String(valve) + " slot" + String(slot+1) +
-          " @ " + timeStr(h,m) + " " + String(dur) + "s"
-        : "⚠️ Saved locally — node unreachable");
-}
+    // /delsched — requires explicit number to prevent silent #0 deletion
+    if (t.startsWith("/delsched ")) {
+      String ns = t.substring(10); ns.trim();
+      if (!ns.length()) {
+        bot.sendMessage(chatStr,
+          "Usage: /delsched <number>   e.g. /delsched 2", "");
+        return;
+      }
+      int n = ns.toInt();
+      if (n >= 0 && n < MAX_SCHEDULES && schedules[n].active) {
+        schedules[n].active = false;
+        saveSchedules();
+        addLog("Sched #" + String(n) + " deleted");
+        bot.sendMessage(chatStr,
+          "✅ Schedule #" + String(n) + " deleted", "");
+      } else {
+        bot.sendMessage(chatStr,
+          "❌ No active schedule at #" + String(n), "");
+      }
+      return;
+    }
 
-static void handleClrSchedule(const String& text) {
-    if (text.length() < 14) { tgSend("❌ Format: CLR V1 SCHED 1"); return; }
-    int valve = text.charAt(5) - '0';
-    if (valve < 1 || valve > NUM_NODES) { tgSend("❌ Valve 1-4"); return; }
-    int sp = text.indexOf("SCHED ");
-    if (sp < 0) { tgSend("❌ Missing SCHED"); return; }
-    int slot = text.charAt(sp + 6) - '1';
-    if (slot < 0 || slot >= MAX_SCHEDULES) { tgSend("❌ Slot 1-3"); return; }
+    // /delsched bare — show help (never silently deletes)
+    if (t == "/delsched") {
+      bot.sendMessage(chatStr,
+        "Usage: /delsched <number>   e.g. /delsched 2\n\n" +
+        buildSchedList(), "Markdown");
+      return;
+    }
 
-    nodes[valve].schedules[slot].active = false;
-    saveSchedule((uint8_t)valve, (uint8_t)slot);
-    bool ok = sendCommand((uint8_t)valve, CMD_CLR_SCHEDULE, (uint8_t)slot);
-    tgSend(ok ? "🗑 Cleared V" + String(valve) + " slot" + String(slot+1)
-              : "⚠️ Cleared locally — node unreachable");
-}
+    // /log
+    if (t == "/log") {
+      String msg = "📜 *Activity Log*\n";
+      int from = max(0, logCount - 20);
+      for (int l = from; l < logCount; l++) msg += logBuf[l] + "\n";
+      if (!logCount) msg += "_Empty_";
+      bot.sendMessage(chatStr, msg, "Markdown");
+      return;
+    }
 
-static void handleSetTime(const String& text) {
-    if (text.length() < 13) { tgSend("❌ Format: SET TIME HH:MM"); return; }
-    int h = text.substring(9,  11).toInt();
-    int m = text.substring(12, 14).toInt();
-    if (h < 0 || h > 23 || m < 0 || m > 59) { tgSend("❌ Bad time"); return; }
-    if (!rtcOK) { tgSend("❌ RTC not available"); return; }
-    DateTime now = rtc.now();
-    rtc.adjust(DateTime(now.year(), now.month(), now.day(), (uint8_t)h, (uint8_t)m, 0));
-    tgSend("🕐 RTC set to " + timeStr(h, m));
-}
+    // /users
+    if (t == "/users") {
+      String msg = "👥 *Users (" + String(userCount) + ")*\n";
+      for (int k = 0; k < userCount; k++) {
+        msg += String(users[k]);
+        if (users[k] == ADMIN_ID) msg += " *(admin)*";
+        msg += "\n";
+      }
+      bot.sendMessage(chatStr, msg, "Markdown");
+      return;
+    }
 
-// ================================================================
-//  TELEGRAM POLL + DISPATCH
-// ================================================================
-static void handleTelegram() {
-    if (millis() - lastTelegramPoll < TELEGRAM_POLL_MS) return;
-    if (WiFi.status() != WL_CONNECTED) return;
-    lastTelegramPoll = millis();
+    // /dns — verifyDNS() is blocking; acceptable for an admin diagnostic
+    if (t == "/dns") {
+      String msg = "🌐 *DNS Diagnostic*\n";
+      for (int d = 0; d < 2; d++) {
+        const ip_addr_t* srv = dns_getserver(d);
+        msg += "Slot " + String(d) + ": ";
+        msg += srv ? ipaddr_ntoa(srv) : "empty";
+        msg += "\n";
+      }
+      msg += "\n";
+      msg += verifyDNS() ? "✅ DNS resolving OK" : "❌ DNS FAILED";
+      bot.sendMessage(chatStr, msg, "Markdown");
+      return;
+    }
 
-    int n = bot.getUpdates(bot.last_message_received + 1);
-    while (n > 0) {
-        for (int i = 0; i < n; i++) {
-            String text = bot.messages[i].text;
-            text.trim();
-            Serial.println("[TG] " + text);
+    // /reboot
+    if (t == "/reboot") {
+      bot.sendMessage(chatStr, "🔄 Rebooting...", "");
+      delay(500);
+      ESP.restart();
+      return;
+    }
+  }
 
-            if (text == "/start" || text == "Menu")     { sendMainMenu();    continue; }
-            if (text == "📡 Status")                    { sendSystemStatus(); continue; }
-            if (text == "📅 Schedules")                 { sendScheduleHelp(); continue; }
-            if (text == "🕐 RTC")                       { sendRTCStatus();   continue; }
+  // ── Back — always available, resets session ─────────────────────
+  if (t == "⬅ Back") {
+    resetSession(s);
+    showMain(chatStr);
+    return;
+  }
 
-            bool handled = false;
-            for (uint8_t v = 1; v <= NUM_NODES && !handled; v++) {
-                String vn = String(v);
+  // ── Schedule wizard ─────────────────────────────────────────────
+  if (s->schedStep != SS_NONE) {
 
-                if (text == "💧 V" + vn + " ON") {
-                    uint16_t rt = nodes[v].schedules[0].active
-                                ? nodes[v].schedules[0].duration : 300u;
-                    bool ok = sendCommand(v, CMD_VALVE_ON,
-                                         (uint8_t)(rt>>8), (uint8_t)(rt&0xFF));
-                    if (ok) { nodes[v].valveOnAt = millis(); nodes[v].runtime = rt; }
-                    tgSend(ok ? "💧 Valve " + vn + " ON | " + String(rt) + "s"
-                              : "❌ Valve " + vn + " FAILED — no ACK");
-                    handled = true;
-                }
-                else if (text == "⛔ V" + vn + " OFF") {
-                    bool ok = sendCommand(v, CMD_VALVE_OFF);
-                    if (ok) { nodes[v].valveOpen = false; nodes[v].runtime = 0; }
-                    tgSend(ok ? "⛔ Valve " + vn + " OFF"
-                              : "❌ Valve " + vn + " OFF FAILED");
-                    handled = true;
-                }
-                else if (text == "📊 V" + vn + " Info") {
-                    sendValveInfo(v); handled = true;
-                }
-            }
+    // Step 1 — collect time
+    if (s->schedStep == SS_TIME) {
+      int col = t.indexOf(':');
+      int h   = (col > 0) ? t.substring(0, col).toInt()   : -1;
+      int m   = (col > 0) ? t.substring(col+1).toInt() : -1;
+      if (h >= 0 && h < 24 && m >= 0 && m < 60) {
+        s->schedHour = (uint8_t)h;
+        s->schedMin  = (uint8_t)m;
+        s->schedStep = SS_ACTION;
+        char ts[6]; snprintf(ts, sizeof(ts), "%02d:%02d", h, m);
+        bot.sendMessage(chatStr,
+          "Time: *" + String(ts) + "* IST\n\n"
+          "Turn SSR *ON* or *OFF* at this time?\n"
+          "Reply: ON  or  OFF", "Markdown");
+      } else {
+        bot.sendMessage(chatStr,
+          "❌ Invalid. Use HH:MM  e.g. 06:30 or 22:00", "");
+      }
+      return;
+    }
 
-            if (!handled) {
-                if      (text.startsWith("SET V") && text.indexOf("SCHED") > 0) handleSetSchedule(text);
-                else if (text.startsWith("CLR V") && text.indexOf("SCHED") > 0) handleClrSchedule(text);
-                else if (text.startsWith("SET TIME "))                           handleSetTime(text);
-                else tgSend("❓ Unknown — send /start for menu");
-            }
+    // Step 2 — collect ON/OFF
+    if (s->schedStep == SS_ACTION) {
+      String tU = t; tU.toUpperCase();
+      if (tU == "ON" || tU == "OFF") {
+        int slot = -1;
+        for (int k = 0; k < MAX_SCHEDULES; k++)
+          if (!schedules[k].active) { slot = k; break; }
+
+        if (slot < 0) {
+          bot.sendMessage(chatStr,
+            "❌ Schedule list full (max " + String(MAX_SCHEDULES) + ").\n"
+            "Delete one with /delsched <n>", "");
+        } else {
+          char ts[6];
+          snprintf(ts, sizeof(ts), "%02d:%02d", s->schedHour, s->schedMin);
+          schedules[slot] = { true, s->schedHour, s->schedMin,
+                              (tU == "ON"), 0x7F };
+          saveSchedules();
+          addLog("Sched #" + String(slot) + " " + tU + " " + ts);
+          bot.sendMessage(chatStr,
+            "✅ *Schedule #" + String(slot) + " saved*\n"
+            "SSR → *" + tU + "* at *" + ts + "* every day",
+            "Markdown");
         }
-        n = bot.getUpdates(bot.last_message_received + 1);
+        resetSession(s);
+        showMain(chatStr);
+      } else {
+        bot.sendMessage(chatStr, "Reply *ON* or *OFF*", "Markdown");
+      }
+      return;
     }
+  }
+
+  // ── Custom timer input ──────────────────────────────────────────
+  if (s->awaitTimerMin) {
+    int mins = t.toInt();
+    if (mins >= 1 && mins <= 1440) {
+      setTimer((uint16_t)mins);
+      addLog("User " + String(chatId) + " set timer " + mins + "min");
+      bot.sendMessage(chatStr,
+        "⏱ SSR ON for *" + String(mins) + " min*. Auto-OFF at expiry.",
+        "Markdown");
+      s->awaitTimerMin = false;
+      showMain(chatStr);
+    } else {
+      bot.sendMessage(chatStr,
+        "❌ Enter a number between 1 and 1440 (minutes)", "");
+    }
+    return;
+  }
+
+  // ── Mains ON confirmation response ─────────────────────────────
+  if (s->awaitConfirm) {
+    // Signed subtraction: confirmExpiry - millis() > 0 means still valid
+    bool valid = ((long)(s->confirmExpiry - millis()) > 0);
+
+    if (t == "✅ YES — Switch ON") {
+      if (valid) {
+        setSSR(true);
+        addLog("User " + String(chatId) + " confirmed SSR ON");
+        String msg = "⚡ *SSR ON* 🟢\n";
+#if AUTO_OFF_HOURS > 0
+        msg += "Safety auto-OFF in " + String(AUTO_OFF_HOURS) + "h.";
+#endif
+        bot.sendMessage(chatStr, msg, "Markdown");
+      } else {
+        bot.sendMessage(chatStr,
+          "⏱ Confirmation expired.\nPress *SSR ON* again.", "Markdown");
+      }
+      s->awaitConfirm = false;
+      showMain(chatStr);
+
+    } else if (t == "❌ CANCEL") {
+      s->awaitConfirm = false;
+      bot.sendMessage(chatStr, "Cancelled.", "");
+      showMain(chatStr);
+
+    } else {
+      // Any other input while awaiting confirm
+      if (valid) {
+        bot.sendMessage(chatStr,
+          "⚠ Tap *YES* to switch SSR ON or *CANCEL*.", "Markdown");
+      } else {
+        s->awaitConfirm = false;
+        bot.sendMessage(chatStr, "Confirmation expired.", "");
+        showMain(chatStr);
+      }
+    }
+    return;
+  }
+
+  // ── Main keyboard buttons ───────────────────────────────────────
+
+  if (t == "⚡ SSR ON") {
+    if (ssrState) {
+      bot.sendMessage(chatStr,
+        "ℹ SSR is already ON.\n"
+        "Use *⏱ Timer* to set auto-OFF, or *⚡ SSR OFF* to switch off.",
+        "Markdown");
+      return;
+    }
+    // Require explicit confirmation before switching 30A mains
+    s->awaitConfirm  = true;
+    s->confirmExpiry = millis() + 30000;   // 30-second window
+    bot.sendMessageWithReplyKeyboard(chatStr,
+      "⚠ *Confirm: Switch SSR ON?*\n\n"
+      "This switches the 30A mains supply.\n"
+      "Window expires in *30 seconds*.",
+      "Markdown", KBD_CONFIRM, true);
+    return;
+  }
+
+  if (t == "⚡ SSR OFF") {
+    if (!ssrState) {
+      bot.sendMessage(chatStr, "ℹ SSR is already OFF.", "");
+      return;
+    }
+    setSSR(false);
+    addLog("User " + String(chatId) + " → SSR OFF");
+    bot.sendMessage(chatStr, "⚡ *SSR OFF* ⚫", "Markdown");
+    return;
+  }
+
+  if (t == "⏱ Timer") {
+    bot.sendMessageWithReplyKeyboard(chatStr,
+      "⏱ *Set Timer*\nSSR turns ON and auto-OFF when timer expires.",
+      "Markdown", KBD_TIMER, true);
+    return;
+  }
+
+  if (t == "❌ Cancel Timer") {
+    if (timerActive) {
+      cancelTimer();
+      bot.sendMessage(chatStr,
+        "❌ *Timer cancelled*\n"
+        "SSR stays *" + String(ssrState ? "ON" : "OFF") + "*.",
+        "Markdown");
+    } else {
+      bot.sendMessage(chatStr, "ℹ No active timer.", "");
+    }
+    return;
+  }
+
+  if (t == "📊 STATUS") {
+    bot.sendMessage(chatStr, buildStatus(), "Markdown");
+    return;
+  }
+
+  if (t == "⏰ Schedules") {
+    bot.sendMessageWithReplyKeyboard(chatStr,
+      buildSchedList(), "Markdown", KBD_SCHED, true);
+    return;
+  }
+
+  if (t == "📋 List Schedules") {
+    bot.sendMessage(chatStr, buildSchedList(), "Markdown");
+    return;
+  }
+
+  if (t == "➕ Add Schedule") {
+    s->schedStep = SS_TIME;
+    bot.sendMessage(chatStr,
+      "*Add Schedule*\n\nSend time in 24h format:\n"
+      "*HH:MM*   e.g. 06:30  or  22:00", "Markdown");
+    return;
+  }
+
+  // ── Timer presets (from KBD_TIMER) ─────────────────────────────
+  if (t == "⏱ 30 min") {
+    setTimer(30);
+    bot.sendMessage(chatStr, "⏱ *30 min* timer set. SSR ON.", "Markdown");
+    showMain(chatStr); return;
+  }
+  if (t == "⏱ 1h") {
+    setTimer(60);
+    bot.sendMessage(chatStr, "⏱ *1h* timer set. SSR ON.", "Markdown");
+    showMain(chatStr); return;
+  }
+  if (t == "⏱ 2h") {
+    setTimer(120);
+    bot.sendMessage(chatStr, "⏱ *2h* timer set. SSR ON.", "Markdown");
+    showMain(chatStr); return;
+  }
+  if (t == "⏱ 4h") {
+    setTimer(240);
+    bot.sendMessage(chatStr, "⏱ *4h* timer set. SSR ON.", "Markdown");
+    showMain(chatStr); return;
+  }
+  if (t == "✏ Custom") {
+    s->awaitTimerMin = true;
+    bot.sendMessage(chatStr,
+      "Send timer duration in *minutes* (1–1440):", "Markdown");
+    return;
+  }
+
+  // ── Fallthrough — unknown input ─────────────────────────────────
+  showMain(chatStr);
 }
 
-// ================================================================
-//  SETUP
-// ================================================================
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑯ TELEGRAM POLL
+//  Capped at MAX_POLL_BATCHES to prevent a message flood from
+//  blocking tickTimer() and tickSafety() in the main loop.
+// ═════════════════════════════════════════════════════════════════
+
+void pollTelegram() {
+  int n = bot.getUpdates(bot.last_message_received + 1);
+  if (n > 0) { tLastBotActive = millis(); telegramOK = true; }
+  int batches = 0;
+  while (n > 0 && batches < MAX_POLL_BATCHES) {
+    for (int i = 0; i < n; i++) handleMessage(i);
+    batches++;
+    n = bot.getUpdates(bot.last_message_received + 1);
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑰ SCHEDULE CHECKER + DAILY SUMMARY
+//  Runs once per minute (guarded by lastSchedMinute).
+// ═════════════════════════════════════════════════════════════════
+
+uint8_t lastSchedMinute = 0xFF;
+
+void checkSchedules() {
+  time_t now = time(nullptr);
+  if (now < 100000L) return;   // NTP not synced yet
+
+  struct tm ti;
+  localtime_r(&now, &ti);
+  if ((uint8_t)ti.tm_min == lastSchedMinute) return;
+  lastSchedMinute = (uint8_t)ti.tm_min;
+
+  // Daily summary at midnight IST
+  if (ti.tm_hour == 0 && ti.tm_min == 0 && ti.tm_mday != lastSummaryDay) {
+    lastSummaryDay = (int8_t)ti.tm_mday;
+    unsigned long liveSec = ssrState ? (millis() - ssrOnSinceMs) / 1000 : 0;
+    String sum = "📊 *Daily Summary*\n";
+    sum += "ON events: *" + String(todayOnCount) + "*\n";
+    sum += "Total ON time: *" + String((todayOnSeconds + liveSec) / 60) + " min*\n";
+    sum += "SSR now: *" + String(ssrState ? "ON" : "OFF") + "*\n";
+    sum += "Lifetime: *" + String(lifetimeOnCount) + "* events";
+    sendAdminAlert(sum);
+    todayOnCount   = 0;
+    todayOnSeconds = 0;
+  }
+
+  // Fire scheduled ON/OFF events
+  uint8_t dayBit = (uint8_t)(1 << ti.tm_wday);
+  for (int i = 0; i < MAX_SCHEDULES; i++) {
+    if (!schedules[i].active)            continue;
+    if (schedules[i].hour   != ti.tm_hour)  continue;
+    if (schedules[i].minute != ti.tm_min)   continue;
+    if (!(schedules[i].days & dayBit))   continue;
+
+    char ts[6];
+    snprintf(ts, sizeof(ts), "%02d:%02d", ti.tm_hour, ti.tm_min);
+    bool on = schedules[i].on;
+
+    setSSR(on);   // scheduled events bypass user confirmation (intentional)
+    addLog("[SCHED] SSR " + String(on ? "ON" : "OFF") + " " + ts);
+    sendAdminAlert("⏰ Schedule: SSR *" +
+                   String(on ? "ON" : "OFF") + "* at *" + ts + "*");
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑱ SETUP
+// ═════════════════════════════════════════════════════════════════
+
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n[BOOT] Gateway v2.2");
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║  TTC SSR Controller  v1.0            ║");
+  Serial.println("║  Single-node · Jio WiFi · Telegram   ║");
+  Serial.println("╚══════════════════════════════════════╝\n");
 
-    // RTC on custom I2C pins
-    Wire.begin(RTC_SDA, RTC_SCL);
-    if (rtc.begin(&Wire)) {
-        rtcOK = true;
-        if (rtc.lostPower()) {
-            Serial.println("[RTC] Lost power — using compile time. Set via: SET TIME HH:MM");
-            rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-        }
-        Serial.println("[RTC] Ready");
-    } else {
-        Serial.println("[RTC] NOT FOUND — scheduling disabled");
+  // ── SSR pin — LOW before OUTPUT to guarantee OFF at power-on ───
+  // Setting the output register before enabling the output driver
+  // prevents any transient HIGH pulse during GPIO initialisation.
+  digitalWrite(PIN_SSR, LOW);
+  pinMode(PIN_SSR, OUTPUT);
+  Serial.println("[SSR] GPIO 25 → LOW (OFF). SSR safe state confirmed.");
+
+  // ── NVS flash init — required before any Preferences call ───────
+  // Fixes "nvs_open failed: NOT_FOUND" on first flash.
+  // Auto-repairs corrupt partition.
+  esp_err_t nvsErr = nvs_flash_init();
+  if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES ||
+      nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    Serial.println("[NVS] Partition issue — erasing and reinitialising");
+    nvs_flash_erase();
+    nvs_flash_init();
+  }
+  Serial.println("[NVS] Ready");
+
+  // ── Telegram client config ───────────────────────────────────────
+  secClient.setInsecure();
+  secClient.setTimeout(6);   // 6s cap per attempt — limits DNS-fail hangs
+
+  // ── WiFi + DNS ───────────────────────────────────────────────────
+  bool wifiOk = connectWiFi();
+
+  // ── NTP — IST = UTC+5:30 = 19800 seconds ────────────────────────
+  configTime(19800, 0, "pool.ntp.org", "time.google.com");
+
+  // ── Load persisted data ──────────────────────────────────────────
+  loadUsers();
+  loadSchedules();
+  loadStats();
+
+  // ── Discard pre-boot Telegram backlog ────────────────────────────
+  bot.getUpdates(0);
+
+  // Initialise all timing references to now
+  tLastBotActive = tLastPoll = tLastWifiCheck = tLastDnsRetry = millis();
+
+  Serial.printf("[MAC]  %s\n", WiFi.macAddress().c_str());
+  Serial.printf("[STATS] Lifetime ON count: %d\n", lifetimeOnCount);
+
+  // ── Boot notification (3 attempts, 5s apart) ─────────────────────
+  if (wifiOk && telegramOK) {
+    String msg = "🟢 *TTC SSR Controller v1 Online*\n\n";
+    msg += "📡 " + wifiSSID + "  " + String(WiFi.RSSI()) + " dBm\n";
+    msg += "🌐 DNS: 8.8.8.8 ✅\n";
+    msg += "⚡ SSR: *OFF* (safe state)\n";
+    msg += "🔋 Ready\n\n";
+    msg += "Lifetime ON count: *" + String(lifetimeOnCount) + "*";
+
+    bool sent = false;
+    for (int attempt = 1; attempt <= 3 && !sent; attempt++) {
+      Serial.printf("[Bot] Boot notification %d/3\n", attempt);
+      if (bot.sendMessageWithReplyKeyboard(
+            String(ADMIN_ID), msg, "Markdown", KBD_MAIN, true)) {
+        sent = true;
+        Serial.println("[Bot] Sent OK");
+      } else {
+        Serial.println("[Bot] Failed — re-applying DNS, waiting 5s");
+        forceDNS();
+        delay(5000);
+      }
     }
-
-    wifiConnect();
-    secClient.setInsecure();
-    setupLoRa();
-    loadAllSchedules();
-
-    sendMainMenu();
-    String boot = "🌱 Gateway Online v2.2";
-    if (rtcOK) {
-        DateTime now = rtc.now();
-        char tb[8]; snprintf(tb, sizeof(tb), "%02d:%02d", now.hour(), now.minute());
-        boot += "\n🕐 " + String(tb);
+    if (!sent) {
+      telegramOK = false;
+      Serial.println("[Bot] All attempts failed — checkDNS() will retry");
     }
-    tgSend(boot);
+  } else if (wifiOk) {
+    Serial.println("[Bot] WiFi up, DNS not ready — will retry in loop()");
+  } else {
+    Serial.println("[Bot] WiFi offline — SSR still operates via schedules");
+  }
+
+  Serial.println("\n[READY] Controller online.");
+  Serial.println("──────────────────────────────────────────────────────\n");
 }
 
-// ================================================================
-//  LOOP
-// ================================================================
+
+// ═════════════════════════════════════════════════════════════════
+//  ⑲ LOOP
+// ═════════════════════════════════════════════════════════════════
+
 void loop() {
-    receiveLoRa();      // HB + alerts only (does NOT consume ACKs)
-    checkSchedules();   // RTC schedule trigger
-    checkAutoOff();     // millis runtime enforcement
-    checkHeartbeat();   // offline detection
-    checkWiFi();        // reconnect watchdog
-    handleTelegram();   // Telegram poll + dispatch
+  unsigned long now = millis();
+
+  // ── Telegram poll ─────────────────────────────────────────────
+  if (WiFi.status() == WL_CONNECTED &&
+      telegramOK &&
+      now - tLastPoll >= POLL_MS) {
+    pollTelegram();
+    tLastPoll = millis();
+  }
+
+  // ── WiFi watchdog — every 30s ─────────────────────────────────
+  if (now - tLastWifiCheck >= WIFI_CHECK_MS) {
+    checkWiFi();
+    tLastWifiCheck = millis();
+  }
+
+  // ── DNS watchdog — re-applies override when Telegram is silent ─
+  checkDNS();
+
+  // ── TLS watchdog — reset if bot silent for 90s ────────────────
+  if (now - tLastBotActive >= BOT_WATCHDOG_MS) {
+    secClient.stop();
+    tLastBotActive = millis();
+    Serial.println("[Bot] TLS watchdog — connection reset");
+  }
+
+  // ── SSR safety ticks — run every loop, never blocked ─────────
+  tickTimer();
+  tickSafety();
+
+  // ── Schedule checker + daily summary ─────────────────────────
+  checkSchedules();
+
+  // ── Expire stale confirmations ────────────────────────────────
+  tickConfirmExpiry();
+
+  delay(10);
 }
